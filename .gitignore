@@ -1,0 +1,6 @@
+# Intellij ide
+.idea/
+#ouput directory
+outDir/
+#Node modules
+node_modules/
