@@ -1,11 +1,58 @@
-import express, { Express, Request, Response } from 'express';
+import express, { Express, Request, Response, NextFunction } from 'express';
 import axios, { AxiosResponse } from 'axios';
 import { JSDOM } from 'jsdom';
+import cors from 'cors';
+import { v4 as uuidv4 } from 'uuid';
 
+// --- Types ---
+type Severity = "Critical" | "High" | "Medium" | "Low" | "Informational";
+
+interface Vulnerability {
+  id: string;
+  type: string;
+  description: string;
+  severity: Severity;
+  resource: string;
+  domainScanned: string;
+}
+
+// --- Express App Setup ---
 const app: Express = express();
 app.use(express.json());
+app.use(cors({ origin: /localhost:3000$/, credentials: true }));
 
-// Helper function to analyze security weaknesses
+// --- Logger Middleware ---
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// --- Input Validation Middleware ---
+function validateDomain(req: Request, res: Response, next: NextFunction) {
+  const { domain } = req.body;
+  try {
+    if (!domain || typeof domain !== 'string') {
+      return res.status(400).json({ error: 'Domain URL is required.' });
+    }
+    // Only allow http(s) URLs, no IPs, no localhost, no file://, etc.
+    const url = new URL(domain);
+    if (!/^https?:$/.test(url.protocol)) {
+      return res.status(400).json({ error: 'Only http(s) URLs are allowed.' });
+    }
+    if (/^(localhost|127\.|0\.)/.test(url.hostname) || url.hostname === '0.0.0.0') {
+      return res.status(400).json({ error: 'Localhost and private IPs are not allowed.' });
+    }
+    // Optionally: block common private IP ranges
+    if (/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(url.hostname)) {
+      return res.status(400).json({ error: 'Private IP addresses are not allowed.' });
+    }
+    next();
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid domain URL.' });
+  }
+}
+
+// --- Helper: Analyze Content ---
 function analyzeContent(html: string, cspHeaders: string | undefined) {
   const dom = new JSDOM(html);
   const scripts = Array.from(dom.window.document.querySelectorAll('script'));
@@ -33,21 +80,65 @@ function analyzeContent(html: string, cspHeaders: string | undefined) {
   };
 }
 
-// Define the expected request body type for analyze-domain
-interface AnalyzeDomainRequestBody {
-  domain?: string;
+// --- Helper: Generate Vulnerabilities ---
+function generateVulnerabilities(analysis: ReturnType<typeof analyzeContent>, domain: string): Vulnerability[] {
+  const vulns: Vulnerability[] = [];
+  if (analysis.usesEval) {
+    vulns.push({
+      id: uuidv4(),
+      type: 'JavaScript Eval Usage',
+      description: 'The page uses eval(), which can lead to XSS vulnerabilities.',
+      severity: 'High',
+      resource: 'eval()',
+      domainScanned: domain,
+    });
+  }
+  if (analysis.usesDocumentWrite) {
+    vulns.push({
+      id: uuidv4(),
+      type: 'document.write Usage',
+      description: 'The page uses document.write(), which can be exploited for XSS.',
+      severity: 'Medium',
+      resource: 'document.write()',
+      domainScanned: domain,
+    });
+  }
+  if (analysis.inlineScriptsCount > 0) {
+    vulns.push({
+      id: uuidv4(),
+      type: 'Inline Scripts',
+      description: `The page contains ${analysis.inlineScriptsCount} inline <script> tag(s).`,
+      severity: analysis.inlineScriptsCount > 2 ? 'Medium' : 'Low',
+      resource: 'inline <script>',
+      domainScanned: domain,
+    });
+  }
+  for (const cspIssue of analysis.cspIssues) {
+    vulns.push({
+      id: uuidv4(),
+      type: 'CSP Policy',
+      description: cspIssue,
+      severity: cspIssue.includes('missing') ? 'Medium' : 'Low',
+      resource: 'Content-Security-Policy',
+      domainScanned: domain,
+    });
+  }
+  // If no issues found, add informational
+  if (vulns.length === 0) {
+    vulns.push({
+      id: uuidv4(),
+      type: 'No Critical Vulnerabilities Detected',
+      description: 'No major client-side vulnerabilities detected by static analysis.',
+      severity: 'Informational',
+      resource: domain,
+      domainScanned: domain,
+    });
+  }
+  return vulns;
 }
 
-// Define the expected request body type for remediation-steps
-interface RemediationStepsRequestBody {
-  description?: string;
-  domain?: string;
-}
-
-// Helper function to generate remediation steps (placeholder logic)
+// --- Helper: Generate Remediation Steps ---
 function generateRemediationSteps(description: string, domain: string): string {
-  // Placeholder logic: generate steps based on description keywords
-
   const steps: string[] = [];
   if (description.toLowerCase().includes('xss') || description.toLowerCase().includes('cross-site scripting')) {
     steps.push(
@@ -74,64 +165,73 @@ function generateRemediationSteps(description: string, domain: string): string {
   return steps.join('\n');
 }
 
-// POST endpoint to analyze a domain
+// --- POST /analyze-domain ---
 app.post(
-    '/analyze-domain',
-    async (
-        req: Request<{}, any, AnalyzeDomainRequestBody, {}, Record<string, any>>,
-        res: Response
-    ): Promise<void> => {
-      const { domain } = req.body;
-
-      if (!domain) {
-        res.status(400).json({ error: 'Domain URL is required.' });
-        return;
-      }
-
-      try {
-        // Fetch the domain's HTML and headers
-        const response: AxiosResponse = await axios.get(domain);
-        const html: string = response.data;
-        const cspHeaders: string | undefined = response.headers['content-security-policy'];
-
-        // Analyze the content
-        const analysis = analyzeContent(html, cspHeaders);
-
-        res.json({
-          domain,
-          analysis,
-        });
-      } catch (error: any) {
-        res.status(500).json({ error: 'Failed to fetch or analyze the domain.', details: error.message });
-      }
+  '/analyze-domain',
+  validateDomain,
+  async (
+    req: Request<{}, any, { domain?: string }, {}, Record<string, any>>,
+    res: Response
+  ): Promise<void> => {
+    const { domain } = req.body;
+    try {
+      // Fetch the domain's HTML and headers
+      const response: AxiosResponse = await axios.get(domain, {
+        timeout: 10000,
+        maxRedirects: 3,
+        headers: { 'User-Agent': 'Inspectra-Scanner/1.0' },
+        validateStatus: (status) => status < 500 // Only throw for 5xx
+      });
+      const html: string = response.data;
+      const cspHeaders: string | undefined = response.headers['content-security-policy'];
+      const analysis = analyzeContent(html, cspHeaders);
+      const vulnerabilities = generateVulnerabilities(analysis, domain);
+      const message = `Scan completed successfully. ${vulnerabilities.length} potential issue(s) detected.`;
+      res.json({
+        domain,
+        analysis: {
+          vulnerabilities,
+          message,
+        },
+      });
+    } catch (error: any) {
+      console.error('Error during /analyze-domain:', error.message);
+      let userMsg = 'Failed to fetch or analyze the domain.';
+      if (error.code === 'ECONNABORTED') userMsg = 'Connection timed out while fetching the domain.';
+      if (error.response && error.response.status) userMsg += ` (HTTP ${error.response.status})`;
+      res.status(500).json({ error: userMsg });
     }
+  }
 );
 
-// POST endpoint for remediation steps
+// --- POST /remediation-steps ---
 app.post(
-    '/remediation-steps',
-    async (
-        req: Request<{}, any, RemediationStepsRequestBody, {}, Record<string, any>>,
-        res: Response
-    ): Promise<void> => {
-      const { description, domain } = req.body;
-
-      if (!description || !domain) {
-        res.status(400).json({ error: 'Description and domain are required.' });
-        return;
-      }
-
-      try {
-        // Generate remediation steps (replace with AI model or external service integration as needed)
-        const steps = generateRemediationSteps(description, domain);
-        res.json({ steps });
-      } catch (error: any) {
-        res.status(500).json({ error: 'Failed to generate remediation steps.', details: error.message });
-      }
+  '/remediation-steps',
+  async (
+    req: Request<{}, any, { description?: string; domain?: string }, {}, Record<string, any>>,
+    res: Response
+  ): Promise<void> => {
+    const { description, domain } = req.body;
+    if (!description || !domain) {
+      return res.status(400).json({ error: 'Description and domain are required.' });
     }
+    try {
+      const steps = generateRemediationSteps(description, domain);
+      res.json({ steps });
+    } catch (error: any) {
+      console.error('Error during /remediation-steps:', error.message);
+      res.status(500).json({ error: 'Failed to generate remediation steps.' });
+    }
+  }
 );
 
-// Start the server
+// --- Error Handler ---
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error.' });
+});
+
+// --- Start Server ---
 const PORT: number = 3000;
 app.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
