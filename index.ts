@@ -28,29 +28,39 @@ app.use((req, res, next) => {
 });
 
 // --- Input Validation Middleware ---
-function validateDomain(req: Request, res: Response, next: NextFunction) {
-  const { domain } = req.body;
+function validateDomain(req: Request, res: Response, next: NextFunction): void {
+  let { domain } = req.body;
+
   try {
     if (!domain || typeof domain !== 'string') {
-      return res.status(400).json({ error: 'Domain URL is required.' });
+      res.status(400).json({ error: 'Domain URL is required.' });
+      return;
     }
-    // Only allow http(s) URLs, no IPs, no localhost, no file://, etc.
+
+    // Automatically prepend https:// if no protocol is provided
+    if (!/^https?:\/\//i.test(domain)) {
+      domain = 'https://' + domain;
+    }
+
     const url = new URL(domain);
+
+    // Only allow HTTP or HTTPS URLs
     if (!/^https?:$/.test(url.protocol)) {
-      return res.status(400).json({ error: 'Only http(s) URLs are allowed.' });
+      res.status(400).json({ error: 'Only http(s) URLs are allowed.' });
+      return;
     }
-    if (/^(localhost|127\.|0\.)/.test(url.hostname) || url.hostname === '0.0.0.0') {
-      return res.status(400).json({ error: 'Localhost and private IPs are not allowed.' });
-    }
-    // Optionally: block common private IP ranges
-    if (/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(url.hostname)) {
-      return res.status(400).json({ error: 'Private IP addresses are not allowed.' });
-    }
+
+    // In development mode, allow local/private IPs (e.g. localhost, 127.0.0.1, 192.168.x.x, etc.)
+    // In production, you may want to restrict this for security
+    req.body.domain = url.toString(); // Normalize and update the domain value
     next();
+
   } catch (e) {
-    return res.status(400).json({ error: 'Invalid domain URL.' });
+    res.status(400).json({ error: 'Invalid domain URL.' });
+    return;
   }
 }
+
 
 // --- Helper: Analyze Content ---
 function analyzeContent(html: string, cspHeaders: string | undefined) {
@@ -167,42 +177,46 @@ function generateRemediationSteps(description: string, domain: string): string {
 
 // --- POST /analyze-domain ---
 app.post(
-  '/analyze-domain',
-  validateDomain,
-  async (
-    req: Request<{}, any, { domain?: string }, {}, Record<string, any>>,
-    res: Response
-  ): Promise<void> => {
-    const { domain } = req.body;
-    try {
-      // Fetch the domain's HTML and headers
-      const response: AxiosResponse = await axios.get(domain, {
-        timeout: 10000,
-        maxRedirects: 3,
-        headers: { 'User-Agent': 'Inspectra-Scanner/1.0' },
-        validateStatus: (status) => status < 500 // Only throw for 5xx
-      });
-      const html: string = response.data;
-      const cspHeaders: string | undefined = response.headers['content-security-policy'];
-      const analysis = analyzeContent(html, cspHeaders);
-      const vulnerabilities = generateVulnerabilities(analysis, domain);
-      const message = `Scan completed successfully. ${vulnerabilities.length} potential issue(s) detected.`;
-      res.json({
-        domain,
-        analysis: {
-          vulnerabilities,
-          message,
-        },
-      });
-    } catch (error: any) {
-      console.error('Error during /analyze-domain:', error.message);
-      let userMsg = 'Failed to fetch or analyze the domain.';
-      if (error.code === 'ECONNABORTED') userMsg = 'Connection timed out while fetching the domain.';
-      if (error.response && error.response.status) userMsg += ` (HTTP ${error.response.status})`;
-      res.status(500).json({ error: userMsg });
+    '/analyze-domain',
+    validateDomain,
+    async (
+        req: Request<{}, any, { domain?: string }, {}, Record<string, any>>,
+        res: Response
+    ): Promise<void> => {
+      const domain = req.body.domain!; // <- domain is now guaranteed to exist
+
+      try {
+        const response: AxiosResponse = await axios.get(domain, {
+          timeout: 10000,
+          maxRedirects: 3,
+          headers: { 'User-Agent': 'Inspectra-Scanner/1.0' },
+          validateStatus: (status) => status < 500
+        });
+
+        const html: string = response.data;
+        const cspHeaders: string | undefined = response.headers['content-security-policy'];
+        const analysis = analyzeContent(html, cspHeaders);
+        const vulnerabilities = generateVulnerabilities(analysis, domain);
+        const message = `Scan completed successfully. ${vulnerabilities.length} potential issue(s) detected.`;
+
+        res.json({
+          domain,
+          analysis: {
+            vulnerabilities,
+            message,
+          },
+        });
+
+      } catch (error: any) {
+        console.error('Error during /analyze-domain:', error.message);
+        let userMsg = 'Failed to fetch or analyze the domain.';
+        if (error.code === 'ECONNABORTED') userMsg = 'Connection timed out while fetching the domain.';
+        if (error.response && error.response.status) userMsg += ` (HTTP ${error.response.status})`;
+        res.status(500).json({ error: userMsg });
+      }
     }
-  }
 );
+
 
 // --- POST /remediation-steps ---
 app.post(
@@ -213,8 +227,10 @@ app.post(
   ): Promise<void> => {
     const { description, domain } = req.body;
     if (!description || !domain) {
-      return res.status(400).json({ error: 'Description and domain are required.' });
+      res.status(400).json({ error: 'Description and domain are required.' });
+      return;
     }
+
     try {
       const steps = generateRemediationSteps(description, domain);
       res.json({ steps });
