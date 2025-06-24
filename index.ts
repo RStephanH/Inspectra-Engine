@@ -19,7 +19,6 @@ interface Vulnerability {
 // --- Express App Setup ---
 const app: Express = express();
 app.use(express.json());
-// app.use(cors({ origin: /localhost:3000$/, credentials: true }));
 app.use(cors({ origin: true, credentials: true }));
 
 // --- Logger Middleware ---
